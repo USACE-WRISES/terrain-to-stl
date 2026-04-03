@@ -1341,7 +1341,7 @@ class DesktopGuiWindow(QMainWindow):
         self.pending_benchmark_step: int | None = None
 
         self.setWindowTitle("Terrain to STL Desktop")
-        self.resize(600, 800)
+        self.resize(1200, 600)
         self._build_ui()
         self._apply_empty_converter_state()
 

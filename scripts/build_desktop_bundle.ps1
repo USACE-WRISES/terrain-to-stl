@@ -116,9 +116,10 @@ $hashPath = "$archivePath.sha256"
 $pythonEmbedUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-embed-amd64.zip"
 $pythonEmbedZip = Join-Path $downloadDir "python-$PythonVersion-embed-amd64.zip"
 $bundlePython = Join-Path $bundleRoot 'python.exe'
-$desktopGuiLauncherPath = Join-Path $bundleRoot 'Run Desktop GUI.cmd'
+$desktopGuiLauncherPath = Join-Path $bundleRoot 'Run Terrain-to-STL GUI.cmd'
 $retiredLauncherPaths = @(
     (Join-Path $bundleRoot 'Run Console Converter.cmd'),
+    (Join-Path $bundleRoot 'Run Desktop GUI.cmd'),
     (Join-Path $bundleRoot 'Run Terrain to STL.cmd'),
     (Join-Path $bundleRoot 'Run STL Viewer.cmd')
 )

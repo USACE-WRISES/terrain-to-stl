@@ -538,7 +538,7 @@ export function ConverterWorkspace({
             <strong>Large files or offline runs</strong>
             <p className="muted">
               Download the portable Windows desktop workflow to convert large terrains offline.
-              This v1 bundle is unsigned, so Windows may still warn on some systems.
+              This v1 bundle is unsigned, so Windows may still warn on some systems until a future code-signed release ships.
             </p>
           </div>
           {renderDesktopWorkflowAction('Download Desktop Workflow')}

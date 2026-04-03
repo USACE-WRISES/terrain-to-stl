@@ -211,11 +211,12 @@ dist\desktop-smoke\terrain-to-stl-desktop-windows-x64\
 
 Run these files from that extracted folder:
 
-- `Run Desktop GUI.cmd`
+- `Run Terrain-to-STL GUI.cmd`
 
 The `app\` folder beside it is bundle internals and should stay together with `python.exe`.
-If `Run Desktop GUI.cmd` does not show the viewer loading overlay while opening a large STL, rebuild the bundle from source because the copied desktop app under `dist` is stale.
+If `Run Terrain-to-STL GUI.cmd` does not show the viewer loading overlay while opening a large STL, rebuild the bundle from source because the copied desktop app under `dist` is stale.
 The desktop GUI accepts a terrain file set such as `HDF + VRT/TIF` selections, shows which files are associated with the primary terrain input, includes the same vertical exaggeration control used by the browser viewer, uses fixed sample-step presets `1`, `2`, `4`, `8`, `16`, and `32`, shows per-step STL size estimates plus a calibrated time estimate for the currently selected step, and includes the integrated STL viewer in the same app.
+The current portable Windows bundle is still unsigned. A later release-hardening pass should use trusted RSA-based code signing such as Microsoft Trusted Signing or a public code-signing certificate with timestamping.
 
 ## Requirements
 

@@ -3,11 +3,11 @@ import type { BrowserLimits } from './types';
 export const DESKTOP_WORKFLOW_FILENAME = 'terrain-to-stl-desktop-windows-x64.zip';
 export const DESKTOP_WORKFLOW_REPOSITORY = 'USACE-WRISES/terrain-to-stl';
 export const DESKTOP_WORKFLOW_WARNING =
-  'Portable Windows bundle. Works offline after download. Unsigned v1 build; Windows may still warn on some systems.';
+  'Portable Windows bundle. Works offline after download. Unsigned v1 build; Windows may still warn on some systems until a future code-signed release ships.';
 export const DESKTOP_WORKFLOW_STEPS = [
   'Download the desktop workflow ZIP.',
   'Extract the ZIP to a normal folder on disk.',
-  'Open the extracted folder and run Run Desktop GUI.cmd for the native desktop workflow.',
+  'Open the extracted folder and run Run Terrain-to-STL GUI.cmd for the native desktop workflow.',
 ] as const;
 
 export type DesktopWorkflowRecommendation = {
