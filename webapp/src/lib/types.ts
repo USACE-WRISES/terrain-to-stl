@@ -50,9 +50,22 @@ export type MeshBounds = {
 
 export type SampleStepOption = {
   value: number;
-  estimatedSizeMb: number | null;
+  estimatedSizeBytes: number | null;
+  estimatedWorkingSetBytes: number | null;
+  estimateKind: 'exact' | 'upper-bound';
   disabled: boolean;
   reason: string | null;
+};
+
+export type BrowserLimits = {
+  rasterWidth: number;
+  rasterHeight: number;
+  totalInputBytes: number;
+  estimatedPeakWorkingSetBytes: number;
+  peakWorkingSetLimitBytes: number;
+  stlSizeLimitBytes: number;
+  nearLimit: boolean;
+  blockingReasons: string[];
 };
 
 export type TerrainInspection = {
@@ -61,6 +74,7 @@ export type TerrainInspection = {
   stitchPointCount: number;
   stitchTriangleCount: number;
   hasPopulatedStitchTin: boolean;
+  browserLimits: BrowserLimits;
   sampleStepOptions: SampleStepOption[];
 };
 

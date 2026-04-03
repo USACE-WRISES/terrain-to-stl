@@ -1,11 +1,31 @@
 /// <reference lib="webworker" />
 
 import {
+  decodeTerrainRasterSurfaceForStep,
   decodeTerrainRasterSurface,
+  probeTerrainRaster,
+  type BrowserRefinementRegion,
+  type BrowserRasterProbe,
   type BrowserRasterSurface,
+  type BrowserTerrainSurface,
   type BrowserTerrainInputKind,
 } from '../lib/browserRasterSurface';
+import {
+  type AdaptiveStitchMetrics,
+  buildBrowserLimits,
+  buildSampleStepOptions,
+  BROWSER_PEAK_WORKING_SET_LIMIT_BYTES,
+  estimateAdaptiveStlUpperBoundBytes,
+  estimatePeakWorkingSetBytes,
+  estimateSparsePeakWorkingSetBytes,
+  estimateSurfaceStlBytes,
+  estimateStlUpperBoundBytes,
+  evaluateSampleStep,
+  buildSampleIndices,
+  SAMPLE_STEP_PRESETS,
+} from '../lib/browserTerrainLimits';
 import type {
+  BrowserLimits,
   ConversionProgress,
   ConversionProgressStep,
   ConversionResult,
@@ -29,6 +49,7 @@ type ConvertMessage = {
   files: UploadFilePayload[];
   terrainName: string;
   terrainKind: BrowserTerrainInputKind;
+  terrainMaxElevation: number;
   topElevation: number;
   sampleStep: number;
 };
@@ -53,11 +74,32 @@ type WorkerMessage =
   | ReleaseDownloadMessage;
 
 type PythonInspection = {
-  terrain_max_elevation: number;
+  terrain_max_elevation: number | null;
   resolved_raster_name: string;
   stitch_point_count: number;
   stitch_triangle_count: number;
   has_populated_stitch_tin: boolean;
+  stitch_component_count: number;
+  adaptive_stitch_metrics: Record<string, PythonAdaptiveStitchMetrics>;
+};
+
+type PythonAdaptiveStitchMetrics = {
+  coarse_cell_count: number;
+  refined_cell_count: number;
+  transition_triangle_count: number;
+  refinement_perimeter_cell_count: number;
+  refined_vertex_count: number;
+  largest_refinement_vertex_count: number;
+  region_count: number;
+};
+
+type PythonSparsePlan = {
+  refinement_regions: Array<{
+    row_start: number;
+    row_end: number;
+    col_start: number;
+    col_end: number;
+  }>;
 };
 
 type PythonConversion = {
@@ -73,6 +115,23 @@ type PythonConversion = {
 };
 
 type PythonModule = {
+  inspect_hdf_metadata(
+    sessionDir: string,
+    hdfName: string,
+    resolvedRasterName: string,
+    rasterWidth: number,
+    rasterHeight: number,
+    rasterTransform: number[],
+    rasterMaxElevation?: number | null,
+  ): unknown;
+  build_hdf_sparse_plan(
+    sessionDir: string,
+    hdfName: string,
+    rasterWidth: number,
+    rasterHeight: number,
+    rasterTransform: number[],
+    sampleStep: number,
+  ): unknown;
   inspect_terrain(sessionDir: string, hdfName: string): unknown;
   inspect_terrain_from_surface(sessionDir: string, hdfName: string, surfaceMetaName: string): unknown;
   inspect_surface(sessionDir: string, surfaceMetaName: string): unknown;
@@ -89,6 +148,7 @@ type PythonModule = {
     topElevation: number,
     sampleStep: number,
     surfaceMetaName: string,
+    terrainMaxOverride?: number | null,
     progressCallback?: unknown,
   ): unknown;
   convert_surface(
@@ -97,6 +157,7 @@ type PythonModule = {
     topElevation: number,
     sampleStep: number,
     surfaceMetaName: string,
+    terrainMaxOverride?: number | null,
     progressCallback?: unknown,
   ): unknown;
   destroy?: () => void;
@@ -134,10 +195,6 @@ let activeConversion: ActiveConversionState = {
   downloadUrl: null,
 };
 const PYODIDE_VERSION = '0.29.3';
-const SAMPLE_STEP_PRESETS = [1, 2, 4, 8, 16] as const;
-const SAMPLE_STEP_DISABLED_REASON = 'requires step 1 for stitch-aware terrain';
-const STL_HEADER_BYTES = 84;
-const STL_TRIANGLE_BYTES = 50;
 const PROGRESS_RANGES: Record<ConversionProgressStep, { start: number; end: number }> = {
   'resolve-raster': { start: 0, end: 20 },
   'load-runtime': { start: 20, end: 28 },
@@ -273,34 +330,6 @@ async function ensurePyodide(
   return pyodidePromise;
 }
 
-function toInspectionResult(
-  result: PythonInspection,
-  sampleStepOptions: SampleStepOption[],
-): TerrainInspection {
-  return {
-    terrainMaxElevation: result.terrain_max_elevation,
-    resolvedRasterName: result.resolved_raster_name,
-    stitchPointCount: result.stitch_point_count,
-    stitchTriangleCount: result.stitch_triangle_count,
-    hasPopulatedStitchTin: result.has_populated_stitch_tin,
-    sampleStepOptions,
-  };
-}
-
-function toConversionResult(result: PythonConversion): ConversionResult {
-  return {
-    outputFilename: result.output_filename,
-    terrainMaxElevation: result.terrain_max_elevation,
-    resolvedRasterName: result.resolved_raster_name,
-    triangleCount: result.triangle_count,
-    wallTriangleCount: result.wall_triangle_count,
-    stitchPointCount: result.stitch_point_count,
-    stitchTriangleCount: result.stitch_triangle_count,
-    stitchBridgeTriangleCount: result.stitch_bridge_triangle_count,
-    stlSizeBytes: result.stl_size_bytes,
-  };
-}
-
 async function removeSessionDirectory(pyodide: PyodideInstance, sessionDir: string): Promise<void> {
   const encodedPath = JSON.stringify(sessionDir);
   await pyodide.runPythonAsync(
@@ -373,12 +402,85 @@ function selectTerrainUpload(files: UploadFilePayload[], terrainName: string): U
 function writeBrowserSurfaceFiles(
   pyodide: PyodideInstance,
   sessionDir: string,
-  surface: BrowserRasterSurface,
+  surface: BrowserTerrainSurface,
 ): string {
   const metaName = 'browser_surface.meta.json';
+  if (surface.kind === 'sparse') {
+    const sampledRowsName = 'browser_surface.sampled_rows.i32';
+    const sampledColsName = 'browser_surface.sampled_cols.i32';
+    const coarseElevationsName = 'browser_surface.coarse_elevations.f32';
+    const coarseValidMaskName = 'browser_surface.coarse_valid_mask.u8';
+    const meta = {
+      kind: 'sparse',
+      resolved_raster_name: surface.resolvedRasterName,
+      width: surface.width,
+      height: surface.height,
+      transform: surface.transform,
+      max_elevation: surface.maxElevation,
+      sampled_rows_file: sampledRowsName,
+      sampled_cols_file: sampledColsName,
+      coarse_elevations_file: coarseElevationsName,
+      coarse_valid_mask_file: coarseValidMaskName,
+      refinement_tiles: surface.refinementTiles.map((tile, index) => ({
+        row_start: tile.rowStart,
+        row_end: tile.rowEnd,
+        col_start: tile.colStart,
+        col_end: tile.colEnd,
+        elevations_file: `browser_surface.tile_${index}.elevations.f32`,
+        valid_mask_file: `browser_surface.tile_${index}.valid_mask.u8`,
+      })),
+    };
+
+    pyodide.FS.writeFile(`${sessionDir}/${metaName}`, JSON.stringify(meta));
+    pyodide.FS.writeFile(
+      `${sessionDir}/${sampledRowsName}`,
+      new Uint8Array(
+        surface.sampledRows.buffer,
+        surface.sampledRows.byteOffset,
+        surface.sampledRows.byteLength,
+      ),
+    );
+    pyodide.FS.writeFile(
+      `${sessionDir}/${sampledColsName}`,
+      new Uint8Array(
+        surface.sampledCols.buffer,
+        surface.sampledCols.byteOffset,
+        surface.sampledCols.byteLength,
+      ),
+    );
+    pyodide.FS.writeFile(
+      `${sessionDir}/${coarseElevationsName}`,
+      new Uint8Array(
+        surface.coarseElevations.buffer,
+        surface.coarseElevations.byteOffset,
+        surface.coarseElevations.byteLength,
+      ),
+    );
+    pyodide.FS.writeFile(
+      `${sessionDir}/${coarseValidMaskName}`,
+      new Uint8Array(
+        surface.coarseValidMask.buffer,
+        surface.coarseValidMask.byteOffset,
+        surface.coarseValidMask.byteLength,
+      ),
+    );
+    surface.refinementTiles.forEach((tile, index) => {
+      pyodide.FS.writeFile(
+        `${sessionDir}/browser_surface.tile_${index}.elevations.f32`,
+        new Uint8Array(tile.elevations.buffer, tile.elevations.byteOffset, tile.elevations.byteLength),
+      );
+      pyodide.FS.writeFile(
+        `${sessionDir}/browser_surface.tile_${index}.valid_mask.u8`,
+        new Uint8Array(tile.validMask.buffer, tile.validMask.byteOffset, tile.validMask.byteLength),
+      );
+    });
+    return metaName;
+  }
+
   const elevationsName = 'browser_surface.elevations.f32';
   const validMaskName = 'browser_surface.valid_mask.u8';
   const meta = {
+    kind: 'full',
     resolved_raster_name: surface.resolvedRasterName,
     width: surface.width,
     height: surface.height,
@@ -409,103 +511,6 @@ function writeBrowserSurfaceFiles(
   return metaName;
 }
 
-function buildSampleIndices(size: number, step: number): number[] {
-  const indices: number[] = [];
-  for (let index = 0; index < size; index += step) {
-    indices.push(index);
-  }
-  if (indices.length === 0 || indices[indices.length - 1] !== size - 1) {
-    indices.push(size - 1);
-  }
-  return indices;
-}
-
-function encodeVertex(width: number, row: number, col: number): number {
-  return (row * width) + col;
-}
-
-function updateBoundaryEdges(boundaryEdges: Set<string>, a: number, b: number): void {
-  const key = a < b ? `${a}:${b}` : `${b}:${a}`;
-  if (boundaryEdges.has(key)) {
-    boundaryEdges.delete(key);
-    return;
-  }
-  boundaryEdges.add(key);
-}
-
-function isValidSurfaceCell(surface: BrowserRasterSurface, row: number, col: number): boolean {
-  return surface.validMask[(row * surface.width) + col] !== 0;
-}
-
-function estimateSampleStepSizeMb(surface: BrowserRasterSurface, sampleStep: number): number {
-  const sampledRows = buildSampleIndices(surface.height, sampleStep);
-  const sampledCols = buildSampleIndices(surface.width, sampleStep);
-  const boundaryEdges = new Set<string>();
-  let rasterTriangleCount = 0;
-
-  for (let rowPairIndex = 0; rowPairIndex < sampledRows.length - 1; rowPairIndex += 1) {
-    const row0 = sampledRows[rowPairIndex];
-    const row1 = sampledRows[rowPairIndex + 1];
-
-    for (let colIndex = 0; colIndex < sampledCols.length - 1; colIndex += 1) {
-      const col0 = sampledCols[colIndex];
-      const col1 = sampledCols[colIndex + 1];
-      const a = encodeVertex(surface.width, row0, col0);
-      const b = encodeVertex(surface.width, row1, col0);
-      const c = encodeVertex(surface.width, row1, col1);
-      const d = encodeVertex(surface.width, row0, col1);
-
-      if (
-        isValidSurfaceCell(surface, row0, col0) &&
-        isValidSurfaceCell(surface, row1, col0) &&
-        isValidSurfaceCell(surface, row1, col1)
-      ) {
-        updateBoundaryEdges(boundaryEdges, a, b);
-        updateBoundaryEdges(boundaryEdges, b, c);
-        updateBoundaryEdges(boundaryEdges, c, a);
-        rasterTriangleCount += 1;
-      }
-
-      if (
-        isValidSurfaceCell(surface, row0, col0) &&
-        isValidSurfaceCell(surface, row1, col1) &&
-        isValidSurfaceCell(surface, row0, col1)
-      ) {
-        updateBoundaryEdges(boundaryEdges, a, c);
-        updateBoundaryEdges(boundaryEdges, c, d);
-        updateBoundaryEdges(boundaryEdges, d, a);
-        rasterTriangleCount += 1;
-      }
-    }
-  }
-
-  const totalTriangles = (rasterTriangleCount * 2) + (boundaryEdges.size * 2);
-  return (STL_HEADER_BYTES + (totalTriangles * STL_TRIANGLE_BYTES)) / (1024 * 1024);
-}
-
-function buildSampleStepOptions(
-  surface: BrowserRasterSurface,
-  hasPopulatedStitchTin: boolean,
-): SampleStepOption[] {
-  return SAMPLE_STEP_PRESETS.map((value) => {
-    if (hasPopulatedStitchTin && value !== 1) {
-      return {
-        value,
-        estimatedSizeMb: null,
-        disabled: true,
-        reason: SAMPLE_STEP_DISABLED_REASON,
-      };
-    }
-
-    return {
-      value,
-      estimatedSizeMb: estimateSampleStepSizeMb(surface, value),
-      disabled: false,
-      reason: null,
-    };
-  });
-}
-
 function unwrapPythonResult<T>(value: unknown): T {
   const proxy = value as PyProxyLike<T>;
   if (typeof proxy?.toJs === 'function') {
@@ -520,42 +525,352 @@ function unwrapPythonResult<T>(value: unknown): T {
   return value as T;
 }
 
+type TerrainPreflight = BrowserRasterProbe & {
+  estimatedPeakWorkingSetBytes: number;
+};
+
+function formatBinaryBytes(byteCount: number): string {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let value = byteCount;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(unitIndex === 0 ? 0 : 2)} ${units[unitIndex]}`;
+}
+
+function buildTerrainPreflight(probe: BrowserRasterProbe): TerrainPreflight {
+  return {
+    ...probe,
+    estimatedPeakWorkingSetBytes: estimatePeakWorkingSetBytes(
+      probe.totalInputBytes,
+      probe.largestSourceCellCount,
+      probe.targetCellCount,
+    ),
+  };
+}
+
+function toInspectionResult(
+  result: PythonInspection,
+  terrainMaxElevation: number,
+  sampleStepOptions: SampleStepOption[],
+  browserLimits: BrowserLimits,
+): TerrainInspection {
+  return {
+    terrainMaxElevation,
+    resolvedRasterName: result.resolved_raster_name,
+    stitchPointCount: result.stitch_point_count,
+    stitchTriangleCount: result.stitch_triangle_count,
+    hasPopulatedStitchTin: result.has_populated_stitch_tin,
+    browserLimits,
+    sampleStepOptions,
+  };
+}
+
+function toConversionResult(result: PythonConversion): ConversionResult {
+  return {
+    outputFilename: result.output_filename,
+    terrainMaxElevation: result.terrain_max_elevation,
+    resolvedRasterName: result.resolved_raster_name,
+    triangleCount: result.triangle_count,
+    wallTriangleCount: result.wall_triangle_count,
+    stitchPointCount: result.stitch_point_count,
+    stitchTriangleCount: result.stitch_triangle_count,
+    stitchBridgeTriangleCount: result.stitch_bridge_triangle_count,
+    stlSizeBytes: result.stl_size_bytes,
+  };
+}
+
+function toAdaptiveStitchMetrics(
+  raw: PythonAdaptiveStitchMetrics | undefined,
+): AdaptiveStitchMetrics | null {
+  if (!raw) {
+    return null;
+  }
+
+  return {
+    coarseCellCount: raw.coarse_cell_count,
+    refinedCellCount: raw.refined_cell_count,
+    transitionTriangleCount: raw.transition_triangle_count,
+    refinementPerimeterCellCount: raw.refinement_perimeter_cell_count,
+    refinedVertexCount: raw.refined_vertex_count,
+    largestRefinementVertexCount: raw.largest_refinement_vertex_count,
+    regionCount: raw.region_count,
+  };
+}
+
+function estimateSparseWorkingSetForStep(
+  preflight: TerrainPreflight,
+  sampleStep: number,
+  adaptiveMetrics: AdaptiveStitchMetrics | null = null,
+): number {
+  if (sampleStep <= 1) {
+    return preflight.estimatedPeakWorkingSetBytes;
+  }
+
+  const sampledRowCount = buildSampleIndices(preflight.height, sampleStep).length;
+  const sampledColumnCount = buildSampleIndices(preflight.width, sampleStep).length;
+  const coarseVertexCount = sampledRowCount * sampledColumnCount;
+  const refinedVertexCount = adaptiveMetrics?.refinedVertexCount ?? 0;
+  const largestDecodeWindowCellCount = Math.max(
+    preflight.largestSourceWidth,
+    adaptiveMetrics?.largestRefinementVertexCount ?? 0,
+  );
+  return estimateSparsePeakWorkingSetBytes(
+    preflight.totalInputBytes,
+    largestDecodeWindowCellCount,
+    coarseVertexCount + refinedVertexCount,
+    sampledRowCount,
+    sampledColumnCount,
+  );
+}
+
+function toBrowserRefinementRegions(plan: PythonSparsePlan): BrowserRefinementRegion[] {
+  return plan.refinement_regions.map((region) => ({
+    rowStart: region.row_start,
+    rowEnd: region.row_end,
+    colStart: region.col_start,
+    colEnd: region.col_end,
+  }));
+}
+
+function buildUpperBoundSampleStepOptions(
+  preflight: TerrainPreflight,
+  inspection: PythonInspection,
+): SampleStepOption[] {
+  return buildSampleStepOptions(
+    'upper-bound',
+    (sampleStep) => {
+      const adaptiveMetrics = toAdaptiveStitchMetrics(inspection.adaptive_stitch_metrics[String(sampleStep)]);
+      if (inspection.has_populated_stitch_tin && adaptiveMetrics) {
+        return estimateAdaptiveStlUpperBoundBytes(
+          preflight.width,
+          preflight.height,
+          sampleStep,
+          inspection.stitch_triangle_count,
+          adaptiveMetrics,
+        );
+      }
+
+      return estimateStlUpperBoundBytes(
+        preflight.width,
+        preflight.height,
+        sampleStep,
+        inspection.stitch_triangle_count,
+      );
+    },
+    (sampleStep) => estimateSparseWorkingSetForStep(
+      preflight,
+      sampleStep,
+      inspection.has_populated_stitch_tin
+        ? toAdaptiveStitchMetrics(inspection.adaptive_stitch_metrics[String(sampleStep)])
+        : null,
+    ),
+  );
+}
+
+function buildExactSampleStepOptions(
+  preflight: TerrainPreflight,
+  surface: BrowserRasterSurface,
+): SampleStepOption[] {
+  return buildSampleStepOptions(
+    'exact',
+    (sampleStep) => estimateSurfaceStlBytes(surface, sampleStep),
+    (sampleStep) => estimateSparseWorkingSetForStep(preflight, sampleStep),
+  );
+}
+
+function formatDemInspectLimitError(preflight: TerrainPreflight): string {
+  return [
+    'Browser inspection was blocked before raster decode.',
+    `Estimated peak working set is ${formatBinaryBytes(preflight.estimatedPeakWorkingSetBytes)} (limit ${formatBinaryBytes(BROWSER_PEAK_WORKING_SET_LIMIT_BYTES)}).`,
+    'Large files near these limits may still stall or crash the browser.',
+    'Use a smaller raster, crop the terrain, or use the desktop Python workflow for large local runs.',
+  ].join(' ');
+}
+
+function formatMissingHdfMaxError(preflight: TerrainPreflight): string {
+  return [
+    'The HDF does not expose a terrain max elevation in its metadata.',
+    `Recovering it would require reading the full raster, and the estimated peak working set is ${formatBinaryBytes(preflight.estimatedPeakWorkingSetBytes)} (limit ${formatBinaryBytes(BROWSER_PEAK_WORKING_SET_LIMIT_BYTES)}).`,
+    'Use the desktop Python workflow for this terrain or reduce the raster extent first.',
+  ].join(' ');
+}
+
+function formatBrowserLimitError(
+  sampleStep: number,
+  estimatedSizeBytes: number,
+  estimatedWorkingSetBytes: number,
+  browserLimits: BrowserLimits,
+): string {
+  return [
+    'Browser conversion was blocked before raster decode.',
+    `Estimated peak working set for sample step ${sampleStep} is ${formatBinaryBytes(estimatedWorkingSetBytes)} (limit ${formatBinaryBytes(browserLimits.peakWorkingSetLimitBytes)}).`,
+    `Estimated STL upper bound for sample step ${sampleStep} is ${formatBinaryBytes(estimatedSizeBytes)} (limit ${formatBinaryBytes(browserLimits.stlSizeLimitBytes)}).`,
+    'Files near these limits may still stall or crash the browser.',
+    'Use a smaller cropped terrain, a larger sample step, or the desktop Python workflow for large local runs.',
+  ].join(' ');
+}
+
+async function readHdfMetadata(
+  pyodide: PyodideInstance,
+  sessionDir: string,
+  hdfName: string,
+  resolvedRasterName: string,
+  rasterWidth: number,
+  rasterHeight: number,
+  rasterTransform: number[],
+  rasterMaxElevation: number | null = null,
+): Promise<PythonInspection> {
+  const bridge = pyodide.pyimport('terrain_web_bridge');
+  try {
+    return unwrapPythonResult<PythonInspection>(
+      bridge.inspect_hdf_metadata(
+        sessionDir,
+        hdfName,
+        resolvedRasterName,
+        rasterWidth,
+        rasterHeight,
+        rasterTransform,
+        rasterMaxElevation,
+      ),
+    );
+  } finally {
+    bridge.destroy?.();
+  }
+}
+
+async function readHdfSparsePlan(
+  pyodide: PyodideInstance,
+  sessionDir: string,
+  hdfName: string,
+  rasterWidth: number,
+  rasterHeight: number,
+  rasterTransform: number[],
+  sampleStep: number,
+): Promise<PythonSparsePlan> {
+  const bridge = pyodide.pyimport('terrain_web_bridge');
+  try {
+    return unwrapPythonResult<PythonSparsePlan>(
+      bridge.build_hdf_sparse_plan(
+        sessionDir,
+        hdfName,
+        rasterWidth,
+        rasterHeight,
+        rasterTransform,
+        sampleStep,
+      ),
+    );
+  } finally {
+    bridge.destroy?.();
+  }
+}
+
 async function handleInspect(message: InspectMessage): Promise<void> {
   await cleanupActiveConversion();
-  postStatus('Resolving terrain raster in the browser...');
-  const surface = await decodeTerrainRasterSurface(
+  postStatus('Inspecting terrain raster headers...');
+  const probe = await probeTerrainRaster(
     message.files,
     message.terrainName,
     message.terrainKind,
     postStatus,
   );
-  const pyodide = await ensurePyodide();
-  postStatus(
-    message.terrainKind === 'hdf'
-      ? 'Reading terrain HDF metadata and stitch arrays...'
-      : 'Reading terrain raster metadata...',
-  );
-  const sessionFiles =
-    message.terrainKind === 'hdf' ? [selectTerrainUpload(message.files, message.terrainName)] : [];
-  const sessionDir = ensureWorkFiles(pyodide, sessionFiles);
-  const surfaceMetaName = writeBrowserSurfaceFiles(pyodide, sessionDir, surface);
-  const bridge = pyodide.pyimport('terrain_web_bridge');
-  try {
-    const raw =
-      message.terrainKind === 'hdf'
-        ? unwrapPythonResult<PythonInspection>(
-            bridge.inspect_terrain_from_surface(sessionDir, message.terrainName, surfaceMetaName),
-          )
-        : unwrapPythonResult<PythonInspection>(bridge.inspect_surface(sessionDir, surfaceMetaName));
+  const preflight = buildTerrainPreflight(probe);
+
+  if (message.terrainKind === 'dem') {
+    if (preflight.estimatedPeakWorkingSetBytes > BROWSER_PEAK_WORKING_SET_LIMIT_BYTES) {
+      throw new Error(formatDemInspectLimitError(preflight));
+    }
+
+    postStatus('Reading terrain raster metadata...');
+    const surface = await decodeTerrainRasterSurface(
+      message.files,
+      message.terrainName,
+      message.terrainKind,
+      postStatus,
+    );
+    const raw: PythonInspection = {
+      terrain_max_elevation: surface.maxElevation,
+      resolved_raster_name: surface.resolvedRasterName,
+      stitch_point_count: 0,
+      stitch_triangle_count: 0,
+      has_populated_stitch_tin: false,
+      stitch_component_count: 0,
+      adaptive_stitch_metrics: {},
+    };
+    const sampleStepOptions = buildExactSampleStepOptions(preflight, surface);
+    const browserLimits = buildBrowserLimits(
+      preflight.width,
+      preflight.height,
+      preflight.totalInputBytes,
+      preflight.estimatedPeakWorkingSetBytes,
+      sampleStepOptions,
+    );
     self.postMessage({
       type: 'inspected',
-      payload: toInspectionResult(
-        raw,
-        buildSampleStepOptions(surface, raw.has_populated_stitch_tin),
-      ),
+      payload: toInspectionResult(raw, surface.maxElevation, sampleStepOptions, browserLimits),
+    });
+    return;
+  }
+
+  const pyodide = await ensurePyodide();
+  postStatus('Reading terrain HDF metadata...');
+  const sessionDir = ensureWorkFiles(pyodide, [selectTerrainUpload(message.files, message.terrainName)]);
+  try {
+    let raw = await readHdfMetadata(
+      pyodide,
+      sessionDir,
+      message.terrainName,
+      preflight.resolvedRasterName,
+      preflight.width,
+      preflight.height,
+      Array.from(preflight.transform),
+    );
+    let terrainMaxElevation = raw.terrain_max_elevation;
+
+    if (terrainMaxElevation === null) {
+      if (preflight.estimatedPeakWorkingSetBytes > BROWSER_PEAK_WORKING_SET_LIMIT_BYTES) {
+        throw new Error(formatMissingHdfMaxError(preflight));
+      }
+
+      postStatus('Reading terrain raster metadata to recover terrain max elevation...');
+      const surface = await decodeTerrainRasterSurface(
+        message.files,
+        message.terrainName,
+        message.terrainKind,
+        postStatus,
+      );
+      raw = await readHdfMetadata(
+        pyodide,
+        sessionDir,
+        message.terrainName,
+        preflight.resolvedRasterName,
+        preflight.width,
+        preflight.height,
+        Array.from(preflight.transform),
+        surface.maxElevation,
+      );
+      terrainMaxElevation = raw.terrain_max_elevation;
+    }
+
+    if (terrainMaxElevation === null) {
+      throw new Error('The browser inspector could not determine the terrain max elevation.');
+    }
+
+    const sampleStepOptions = buildUpperBoundSampleStepOptions(preflight, raw);
+    const browserLimits = buildBrowserLimits(
+      preflight.width,
+      preflight.height,
+      preflight.totalInputBytes,
+      preflight.estimatedPeakWorkingSetBytes,
+      sampleStepOptions,
+    );
+    self.postMessage({
+      type: 'inspected',
+      payload: toInspectionResult(raw, terrainMaxElevation, sampleStepOptions, browserLimits),
     });
   } finally {
-    bridge.destroy?.();
     await safeRemoveSessionDirectory(pyodide, sessionDir);
   }
 }
@@ -563,26 +878,150 @@ async function handleInspect(message: InspectMessage): Promise<void> {
 async function handleConvert(message: ConvertMessage): Promise<void> {
   await cleanupActiveConversion();
   const progressReporter = createProgressReporter();
-  progressReporter.reportStage('resolve-raster', 0, 'Resolving terrain raster in the browser...', true);
-  const surface = await decodeTerrainRasterSurface(
+  progressReporter.reportStage('resolve-raster', 0, 'Inspecting terrain raster headers...', true);
+  const probe = await probeTerrainRaster(
     message.files,
     message.terrainName,
     message.terrainKind,
     undefined,
     ({ fraction, message: progressMessage }) => {
-      progressReporter.reportStage('resolve-raster', fraction, progressMessage, fraction === 0 || fraction === 1);
+      progressReporter.reportStage(
+        'resolve-raster',
+        fraction * 0.15,
+        progressMessage,
+        fraction === 0 || fraction === 1,
+      );
     },
   );
-  const pyodide = await ensurePyodide(progressReporter);
-  progressReporter.reportStage('prepare-files', 0, 'Preparing terrain files...', true);
-  const sessionFiles =
-    message.terrainKind === 'hdf' ? [selectTerrainUpload(message.files, message.terrainName)] : [];
-  const sessionDir = ensureWorkFiles(pyodide, sessionFiles);
-  const surfaceMetaName = writeBrowserSurfaceFiles(pyodide, sessionDir, surface);
-  progressReporter.reportStage('prepare-files', 1, 'Prepared terrain files for conversion.', true);
-  const bridge = pyodide.pyimport('terrain_web_bridge');
+  const preflight = buildTerrainPreflight(probe);
+
+  let pyodide: PyodideInstance | null = null;
+  let sessionDir: string | null = null;
+  let bridge: PythonModule | null = null;
   let keepSession = false;
+  let hdfInspection: PythonInspection | null = null;
+
   try {
+    if (message.terrainKind === 'hdf') {
+      pyodide = await ensurePyodide(progressReporter);
+      progressReporter.reportStage('prepare-files', 0, 'Reading terrain HDF metadata...', true);
+      sessionDir = ensureWorkFiles(pyodide, [selectTerrainUpload(message.files, message.terrainName)]);
+      hdfInspection = await readHdfMetadata(
+        pyodide,
+        sessionDir,
+        message.terrainName,
+        preflight.resolvedRasterName,
+        preflight.width,
+        preflight.height,
+        Array.from(preflight.transform),
+      );
+    }
+
+    const sampleStepOptions =
+      message.terrainKind === 'hdf' && hdfInspection
+        ? buildUpperBoundSampleStepOptions(preflight, hdfInspection)
+        : buildSampleStepOptions(
+            'upper-bound',
+            (sampleStep) => estimateStlUpperBoundBytes(preflight.width, preflight.height, sampleStep, 0),
+            (sampleStep) => estimateSparseWorkingSetForStep(preflight, sampleStep),
+          );
+    const selectedSampleStep =
+      sampleStepOptions.find((option) => option.value === message.sampleStep)
+      ?? evaluateSampleStep(
+        message.sampleStep,
+        'upper-bound',
+        estimateStlUpperBoundBytes(
+          preflight.width,
+          preflight.height,
+          message.sampleStep,
+          hdfInspection?.stitch_triangle_count ?? 0,
+        ),
+        estimateSparseWorkingSetForStep(
+          preflight,
+          message.sampleStep,
+          hdfInspection?.has_populated_stitch_tin
+            ? toAdaptiveStitchMetrics(hdfInspection.adaptive_stitch_metrics[String(message.sampleStep)])
+            : null,
+        ),
+      );
+    const browserLimits = buildBrowserLimits(
+      preflight.width,
+      preflight.height,
+      preflight.totalInputBytes,
+      preflight.estimatedPeakWorkingSetBytes,
+      sampleStepOptions,
+    );
+
+    if (selectedSampleStep.disabled) {
+      throw new Error(
+        formatBrowserLimitError(
+          message.sampleStep,
+          selectedSampleStep.estimatedSizeBytes ?? 0,
+          selectedSampleStep.estimatedWorkingSetBytes ?? preflight.estimatedPeakWorkingSetBytes,
+          browserLimits,
+        ),
+      );
+    }
+
+    progressReporter.reportStage('resolve-raster', 0.15, 'Browser limits checked.', true);
+    let refinementRegions: BrowserRefinementRegion[] = [];
+    if (
+      message.sampleStep > 1 &&
+      message.terrainKind === 'hdf' &&
+      pyodide &&
+      sessionDir &&
+      hdfInspection?.has_populated_stitch_tin
+    ) {
+      progressReporter.reportStage('resolve-raster', 0.15, 'Planning sparse stitch-aware refinement regions...', true);
+      const sparsePlan = await readHdfSparsePlan(
+        pyodide,
+        sessionDir,
+        message.terrainName,
+        preflight.width,
+        preflight.height,
+        Array.from(preflight.transform),
+        message.sampleStep,
+      );
+      refinementRegions = toBrowserRefinementRegions(sparsePlan);
+    }
+
+    const decodeMessage =
+      message.sampleStep > 1
+        ? refinementRegions.length > 0
+          ? 'Reading sparse terrain samples and stitch refinement windows into browser memory...'
+          : 'Reading sparse terrain samples into browser memory...'
+        : 'Reading terrain raster into browser memory...';
+    progressReporter.reportStage('resolve-raster', 0.15, decodeMessage, true);
+    const surface = await decodeTerrainRasterSurfaceForStep(
+      message.files,
+      message.terrainName,
+      message.terrainKind,
+      message.sampleStep,
+      refinementRegions,
+      undefined,
+      ({ fraction, message: progressMessage }) => {
+        progressReporter.reportStage(
+          'resolve-raster',
+          0.15 + (fraction * 0.85),
+          progressMessage,
+          fraction === 0 || fraction === 1,
+        );
+      },
+    );
+    progressReporter.reportStage('resolve-raster', 1, 'Resolved terrain raster in the browser.', true);
+
+    if (!pyodide) {
+      pyodide = await ensurePyodide(progressReporter);
+    }
+    if (!sessionDir) {
+      sessionDir = ensureWorkFiles(pyodide, []);
+    }
+
+    progressReporter.reportStage('prepare-files', 0, 'Preparing terrain files...', true);
+    const surfaceMetaName = writeBrowserSurfaceFiles(pyodide, sessionDir, surface);
+    progressReporter.reportStage('prepare-files', 1, 'Prepared terrain files for conversion.', true);
+    bridge = pyodide.pyimport('terrain_web_bridge');
+
     const pythonProgressCallback = (
       step: string,
       completed: number,
@@ -606,6 +1045,7 @@ async function handleConvert(message: ConvertMessage): Promise<void> {
               message.topElevation,
               message.sampleStep,
               surfaceMetaName,
+              message.terrainMaxElevation,
               pythonProgressCallback,
             ),
           )
@@ -616,6 +1056,7 @@ async function handleConvert(message: ConvertMessage): Promise<void> {
               message.topElevation,
               message.sampleStep,
               surfaceMetaName,
+              message.terrainMaxElevation,
               pythonProgressCallback,
             ),
           );
@@ -633,8 +1074,8 @@ async function handleConvert(message: ConvertMessage): Promise<void> {
       payload: result,
     });
   } finally {
-    bridge.destroy?.();
-    if (!keepSession) {
+    bridge?.destroy?.();
+    if (!keepSession && pyodide && sessionDir) {
       await safeRemoveSessionDirectory(pyodide, sessionDir);
     }
   }

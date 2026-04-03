@@ -1,0 +1,47 @@
+name: Build Desktop Bundle
+
+on:
+  workflow_dispatch:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+jobs:
+  build-desktop-bundle:
+    runs-on: windows-latest
+    env:
+      BUNDLE_NAME: terrain-to-stl-desktop-windows-x64
+      BUNDLE_ZIP: dist/desktop/terrain-to-stl-desktop-windows-x64.zip
+      BUNDLE_SHA256: dist/desktop/terrain-to-stl-desktop-windows-x64.zip.sha256
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Build desktop bundle
+        shell: pwsh
+        run: .\scripts\build_desktop_bundle.ps1 -BundleVersion "${{ github.ref_name }}"
+
+      - name: Upload desktop bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-bundle
+          path: |
+            ${{ env.BUNDLE_ZIP }}
+            ${{ env.BUNDLE_SHA256 }}
+
+      - name: Upload release assets
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.BUNDLE_ZIP }}
+            ${{ env.BUNDLE_SHA256 }}

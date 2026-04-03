@@ -1,4 +1,11 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { SAMPLE_STEP_PRESETS } from '../lib/browserTerrainLimits';
+import {
+  DESKTOP_WORKFLOW_STEPS,
+  DESKTOP_WORKFLOW_WARNING,
+  getDesktopWorkflowRecommendation,
+  resolveDesktopWorkflowUrl,
+} from '../lib/desktopWorkflow';
 import type {
   ConversionProgress,
   ConversionProgressStep,
@@ -37,10 +44,12 @@ const PROGRESS_STEP_LABELS: Record<Exclude<ConversionProgressStep, 'complete'>, 
 };
 const INITIAL_CONVERTER_STATUS = 'Select a terrain HDF with its raster files, or a standalone DEM GeoTIFF.';
 const SAMPLE_STEP_TOOLTIP =
-  'Raster sample step controls how densely the raster is sampled for the STL. 1 uses every raster cell for the most detail. Higher values skip cells to reduce detail and usually shrink the STL. The converter still includes the last raster row and column. If the terrain has populated stitch TIN data, only step 1 is supported.';
-const DEFAULT_SAMPLE_STEP_OPTIONS: SampleStepOption[] = [1, 2, 4, 8, 16].map((value) => ({
+  'Raster sample step controls how densely the raster is sampled for the STL. 1 uses every raster cell for the most detail. Higher values skip cells to reduce detail and usually shrink the STL. The converter still includes the last raster row and column. Stitch-aware terrains use local refinement around stitch components and support preset steps 1, 2, 4, 8, 16, and 32.';
+const DEFAULT_SAMPLE_STEP_OPTIONS: SampleStepOption[] = SAMPLE_STEP_PRESETS.map((value) => ({
   value,
-  estimatedSizeMb: null,
+  estimatedSizeBytes: null,
+  estimatedWorkingSetBytes: null,
+  estimateKind: 'upper-bound',
   disabled: false,
   reason: null,
 }));
@@ -78,11 +87,23 @@ function isGeoTiffFile(file: File): boolean {
 }
 
 function formatSampleStepOptionLabel(option: SampleStepOption): string {
+  if (option.estimatedSizeBytes !== null) {
+    const estimateLabel =
+      option.estimateKind === 'upper-bound'
+        ? `up to ${formatBytes(option.estimatedSizeBytes)}`
+        : `~${formatBytes(option.estimatedSizeBytes)}`;
+    const workingSetLabel =
+      option.estimatedWorkingSetBytes === null
+        ? null
+        : `working set ${formatBytes(option.estimatedWorkingSetBytes)}`;
+    const combinedLabel = workingSetLabel === null ? estimateLabel : `${estimateLabel}; ${workingSetLabel}`;
+    if (option.disabled && option.reason) {
+      return `${option.value} (${combinedLabel}; ${option.reason})`;
+    }
+    return `${option.value} (${combinedLabel})`;
+  }
   if (option.disabled && option.reason) {
     return `${option.value} (${option.reason})`;
-  }
-  if (option.estimatedSizeMb !== null) {
-    return `${option.value} (~${option.estimatedSizeMb.toFixed(1)} MB)`;
   }
   return String(option.value);
 }
@@ -140,10 +161,17 @@ export function ConverterWorkspace({
     [uploadedFiles],
   );
   const sampleStepOptions = inspection?.sampleStepOptions ?? DEFAULT_SAMPLE_STEP_OPTIONS;
+  const selectedSampleStepOption = sampleStepOptions.find((option) => String(option.value) === sampleStep) ?? null;
   const terrainInputError = terrainInput.kind === null ? terrainInput.error : null;
   const outputActionBusy = downloadBusy || openInViewerBusy;
   const controlsBusy = working || outputActionBusy || exampleLoadBusy;
-  const canConvert = Boolean(terrainInput.file && inspection && !controlsBusy);
+  const canConvert = Boolean(
+    terrainInput.file &&
+    inspection &&
+    !controlsBusy &&
+    selectedSampleStepOption &&
+    !selectedSampleStepOption.disabled,
+  );
 
   useEffect(() => {
     const selectedOption = sampleStepOptions.find((option) => String(option.value) === sampleStep);
@@ -365,6 +393,7 @@ export function ConverterWorkspace({
         files,
         terrainName: terrainInput.file.name,
         terrainKind: terrainInput.kind,
+        terrainMaxElevation: inspection.terrainMaxElevation,
         topElevation: parsedTop,
         sampleStep: parsedStep,
       },
@@ -436,6 +465,55 @@ export function ConverterWorkspace({
       : progress
         ? PROGRESS_STEP_LABELS[progress.step as Exclude<ConversionProgressStep, 'complete'>]
         : null;
+  const desktopWorkflowUrl = resolveDesktopWorkflowUrl({
+    override: import.meta.env.VITE_DESKTOP_WORKFLOW_URL,
+    hostname: globalThis.location?.hostname,
+    baseUrl: import.meta.env.BASE_URL,
+  });
+  const desktopWorkflowRecommendation =
+    inspection === null ? null : getDesktopWorkflowRecommendation(inspection.browserLimits);
+
+  function renderDesktopWorkflowAction(label: string, className = 'button-link button-secondary'): JSX.Element | null {
+    if (!desktopWorkflowUrl) {
+      return null;
+    }
+
+    return (
+      <a
+        className={className}
+        href={desktopWorkflowUrl}
+        rel="noopener noreferrer"
+      >
+        {label}
+      </a>
+    );
+  }
+
+  function renderDesktopWorkflowCallout(location: 'status' | 'details'): JSX.Element | null {
+    if (!desktopWorkflowRecommendation) {
+      return null;
+    }
+
+    const showSteps = location === 'status';
+    return (
+      <div className={`desktop-workflow-callout ${desktopWorkflowRecommendation.severity}`}>
+        <p className="desktop-workflow-callout-title">{desktopWorkflowRecommendation.headline}</p>
+        <p>{desktopWorkflowRecommendation.summary}</p>
+        {renderDesktopWorkflowAction(
+          showSteps ? 'Download Desktop Workflow ZIP' : 'Download Desktop Workflow',
+          'button-link desktop-workflow-download-link',
+        )}
+        {showSteps ? (
+          <ol className="desktop-workflow-steps">
+            {DESKTOP_WORKFLOW_STEPS.map((step) => (
+              <li key={step}>{step}</li>
+            ))}
+          </ol>
+        ) : null}
+        <p className="muted">{DESKTOP_WORKFLOW_WARNING}</p>
+      </div>
+    );
+  }
 
   return (
     <section className={`converter-workspace ${variant === 'modal' ? 'compact' : 'page'}`}>
@@ -453,6 +531,17 @@ export function ConverterWorkspace({
             </button>
           </div>
           <p className="muted">{description}</p>
+        </div>
+
+        <div className="desktop-workflow-panel">
+          <div>
+            <strong>Large files or offline runs</strong>
+            <p className="muted">
+              Download the portable Windows desktop workflow to convert large terrains offline.
+              This v1 bundle is unsigned, so Windows may still warn on some systems.
+            </p>
+          </div>
+          {renderDesktopWorkflowAction('Download Desktop Workflow')}
         </div>
 
         <label className="field">
@@ -528,7 +617,8 @@ export function ConverterWorkspace({
             <select
               id={sampleStepSelectId}
               value={sampleStep}
-              onChange={(event) => setSampleStep(event.target.value)}
+                    onChange={(event) => setSampleStep(event.target.value)}
+              disabled={controlsBusy || !inspection}
             >
               {sampleStepOptions.map((option) => (
                 <option key={option.value} value={option.value} disabled={option.disabled}>
@@ -548,6 +638,7 @@ export function ConverterWorkspace({
             </p>
           ) : null}
           {!terrainInput.kind && terrainInputError ? <p className="error-text">{terrainInputError}</p> : null}
+          {renderDesktopWorkflowCallout('status')}
           {progress ? (
             <div className="progress-panel">
               <div className="progress-summary">
@@ -600,28 +691,105 @@ export function ConverterWorkspace({
         </div>
 
         {inspection ? (
-          <dl className="details-grid">
-            <div>
-              <dt>Terrain max elevation</dt>
-              <dd>{inspection.terrainMaxElevation.toFixed(6)}</dd>
+          <>
+            <dl className="details-grid">
+              <div>
+                <dt>Terrain max elevation</dt>
+                <dd>{inspection.terrainMaxElevation.toFixed(6)}</dd>
+              </div>
+              <div>
+                <dt>Resolved raster</dt>
+                <dd>{inspection.resolvedRasterName}</dd>
+              </div>
+              <div>
+                <dt>Stitch points</dt>
+                <dd>{inspection.stitchPointCount}</dd>
+              </div>
+              <div>
+                <dt>Stitch triangles</dt>
+                <dd>{inspection.stitchTriangleCount}</dd>
+              </div>
+              <div>
+                <dt>Populated stitch TIN</dt>
+                <dd>{inspection.hasPopulatedStitchTin ? 'Yes' : 'No'}</dd>
+              </div>
+            </dl>
+
+            <div className="browser-limits-panel">
+              <div className="section-heading compact">
+                <h3>Browser Limits</h3>
+                <p className="muted">
+                  Inspect uses raster headers first. Conversion is allowed only when the selected sample step stays inside the browser memory and STL size limits.
+                </p>
+              </div>
+
+              <dl className="details-grid">
+                <div>
+                  <dt>Raster dimensions</dt>
+                  <dd>{inspection.browserLimits.rasterWidth.toLocaleString()} x {inspection.browserLimits.rasterHeight.toLocaleString()}</dd>
+                </div>
+                <div>
+                  <dt>Total uploaded size</dt>
+                  <dd>{formatBytes(inspection.browserLimits.totalInputBytes)}</dd>
+                </div>
+                <div>
+                  <dt>Full-decode / step 1 working set</dt>
+                  <dd>{formatBytes(inspection.browserLimits.estimatedPeakWorkingSetBytes)}</dd>
+                </div>
+                <div>
+                  <dt>Working-set limit</dt>
+                  <dd>{formatBytes(inspection.browserLimits.peakWorkingSetLimitBytes)}</dd>
+                </div>
+                <div>
+                  <dt>Browser STL limit</dt>
+                  <dd>{formatBytes(inspection.browserLimits.stlSizeLimitBytes)}</dd>
+                </div>
+              </dl>
+
+              {selectedSampleStepOption?.estimatedWorkingSetBytes !== null ? (
+                <p className="muted">
+                  Selected step {selectedSampleStepOption.value} working set: {formatBytes(selectedSampleStepOption.estimatedWorkingSetBytes)}.
+                </p>
+              ) : null}
+
+              {inspection.browserLimits.blockingReasons.length > 0 ? (
+                <div className="limit-callout error">
+                  {inspection.browserLimits.blockingReasons.map((reason) => (
+                    <p key={reason}>{reason}</p>
+                  ))}
+                </div>
+              ) : null}
+
+              {inspection.browserLimits.nearLimit ? (
+                <div className="limit-callout warning">
+                  <p>Large files near these limits may still stall or crash the browser.</p>
+                </div>
+              ) : null}
+
+              {renderDesktopWorkflowCallout('details')}
+
+              <div className="sample-step-limit-list">
+                {inspection.sampleStepOptions.map((option) => (
+                  <div key={option.value} className={`sample-step-limit-row ${option.disabled ? 'blocked' : 'allowed'}`}>
+                    <span>Step {option.value}</span>
+                    <span>
+                      {option.estimatedSizeBytes === null
+                        ? 'No size estimate'
+                        : option.estimateKind === 'upper-bound'
+                          ? `Up to ${formatBytes(option.estimatedSizeBytes)}`
+                          : `~${formatBytes(option.estimatedSizeBytes)}`}
+                    </span>
+                    <span>
+                      {option.estimatedWorkingSetBytes === null
+                        ? 'No working-set estimate'
+                        : `Working set ${formatBytes(option.estimatedWorkingSetBytes)}`}
+                    </span>
+                    <span>{option.disabled ? option.reason ?? 'Blocked' : 'Allowed in browser'}</span>
+                  </div>
+                ))}
+              </div>
             </div>
-            <div>
-              <dt>Resolved raster</dt>
-              <dd>{inspection.resolvedRasterName}</dd>
-            </div>
-            <div>
-              <dt>Stitch points</dt>
-              <dd>{inspection.stitchPointCount}</dd>
-            </div>
-            <div>
-              <dt>Stitch triangles</dt>
-              <dd>{inspection.stitchTriangleCount}</dd>
-            </div>
-            <div>
-              <dt>Populated stitch TIN</dt>
-              <dd>{inspection.hasPopulatedStitchTin ? 'Yes' : 'No'}</dd>
-            </div>
-          </dl>
+          </>
         ) : (
           <p className="muted">Run "Inspect Terrain" to read the terrain metadata first.</p>
         )}

@@ -6,3 +6,5 @@ __pycache__/
 webapp/node_modules/
 webapp/dist/
 webapp/.tmp-build/
+dist/
+example/*/

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import math
+import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Iterator
 
 import numpy as np
 import pyvista as pv
@@ -18,6 +21,13 @@ PREVIEW_EMPTY_FRACTION = 0.005
 PREVIEW_BASE_XY_DIVISIONS = 128
 PREVIEW_MIN_XY_DIVISIONS = 48
 PREVIEW_Z_DIVISIONS = 32
+STREAM_CHUNK_TRIANGLES = 100_000
+STL_HEADER_BYTES = 84
+STL_TRIANGLE_BYTES = 50
+EXACT_LOAD_WARNING_FILE_SIZE_BYTES = 512 * 1024 * 1024
+EXACT_LOAD_WARNING_TRIANGLES = 5_000_000
+TRIANGLE_KEY_BIT_SHIFT = 20
+TRIANGLE_KEY_MASK = (1 << TRIANGLE_KEY_BIT_SHIFT) - 1
 VIEWER_WINDOW_SIZE = (1600, 1000)
 DEFAULT_SURFACE_OPACITY = 0.8
 PROFILE_MODE_BOTTOM = "bottom"
@@ -51,6 +61,16 @@ TERRAIN_COLORMAP = LinearSegmentedColormap.from_list(
 
 pv.global_theme.allow_empty_mesh = True
 
+BinaryStlChunk = np.dtype(
+    [
+        ("normal", "<f4", (3,)),
+        ("vertices", "<f4", (3, 3)),
+        ("attribute_byte_count", "<u2"),
+    ]
+)
+
+StatusCallback = Callable[[str], None]
+
 
 class MeshViewerError(Exception):
     pass
@@ -76,12 +96,19 @@ class ProfileResult:
 
 
 @dataclass(frozen=True, slots=True)
+class BinaryStlMetadata:
+    triangle_count: int
+    file_size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class MeshLoadResult:
     render_mesh: pv.PolyData
     exact_mesh: pv.PolyData | None
     render_mode: str
     file_size_bytes: int
     exact_cell_count: int | None
+    exact_load_warning_required: bool = False
 
     @property
     def needs_lazy_exact_load(self) -> bool:
@@ -151,8 +178,213 @@ def prepare_polydata(mesh: pv.PolyData, source: str) -> pv.PolyData:
     return mesh
 
 
-def load_stl_mesh(path: Path) -> pv.PolyData:
-    return prepare_polydata(pv.read(path), str(path))
+def emit_status(status_callback: StatusCallback | None, message: str) -> None:
+    if status_callback is not None:
+        status_callback(message)
+
+
+def inspect_binary_stl(path: Path) -> BinaryStlMetadata | None:
+    file_size_bytes = path.stat().st_size
+    if file_size_bytes < STL_HEADER_BYTES:
+        return None
+
+    with path.open("rb") as file_handle:
+        header = file_handle.read(STL_HEADER_BYTES)
+    if len(header) != STL_HEADER_BYTES:
+        return None
+
+    triangle_count = struct.unpack("<I", header[80:84])[0]
+    expected_size = STL_HEADER_BYTES + (triangle_count * STL_TRIANGLE_BYTES)
+    if expected_size != file_size_bytes:
+        return None
+
+    return BinaryStlMetadata(
+        triangle_count=int(triangle_count),
+        file_size_bytes=int(file_size_bytes),
+    )
+
+
+def requires_exact_load_warning(file_size_bytes: int, triangle_count: int | None) -> bool:
+    return file_size_bytes >= EXACT_LOAD_WARNING_FILE_SIZE_BYTES or (
+        triangle_count is not None and triangle_count >= EXACT_LOAD_WARNING_TRIANGLES
+    )
+
+
+def iter_binary_stl_chunks(path: Path, triangle_count: int) -> Iterator[tuple[int, np.ndarray]]:
+    with path.open("rb") as file_handle:
+        file_handle.seek(STL_HEADER_BYTES)
+        triangles_remaining = int(triangle_count)
+        chunk_index = 0
+        while triangles_remaining > 0:
+            chunk_triangle_count = min(STREAM_CHUNK_TRIANGLES, triangles_remaining)
+            chunk = np.fromfile(file_handle, dtype=BinaryStlChunk, count=chunk_triangle_count)
+            if chunk.shape[0] != chunk_triangle_count:
+                raise MeshViewerError(f"Could not finish reading binary STL data from {path}.")
+            yield chunk_index, chunk
+            triangles_remaining -= chunk_triangle_count
+            chunk_index += 1
+
+
+def progress_update_interval(total_chunks: int) -> int:
+    return max(1, total_chunks // 8) if total_chunks > 0 else 1
+
+
+def read_binary_stl_bounds(
+    path: Path,
+    metadata: BinaryStlMetadata,
+    *,
+    status_callback: StatusCallback | None = None,
+) -> tuple[float, float, float, float, float, float]:
+    if metadata.triangle_count <= 0:
+        raise MeshViewerError(f"{path} does not contain any displayable mesh geometry.")
+
+    total_chunks = max(1, math.ceil(metadata.triangle_count / STREAM_CHUNK_TRIANGLES))
+    status_interval = progress_update_interval(total_chunks)
+
+    min_corner = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
+    max_corner = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
+
+    for chunk_index, chunk in iter_binary_stl_chunks(path, metadata.triangle_count):
+        if (
+            chunk_index == 0
+            or chunk_index + 1 == total_chunks
+            or (chunk_index + 1) % status_interval == 0
+        ):
+            emit_status(status_callback, f"Scanning STL bounds... ({chunk_index + 1}/{total_chunks} chunks)")
+
+        vertices = chunk["vertices"]
+        chunk_min = vertices.min(axis=(0, 1))
+        chunk_max = vertices.max(axis=(0, 1))
+        min_corner = np.minimum(min_corner, chunk_min)
+        max_corner = np.maximum(max_corner, chunk_max)
+
+    return (
+        float(min_corner[0]),
+        float(max_corner[0]),
+        float(min_corner[1]),
+        float(max_corner[1]),
+        float(min_corner[2]),
+        float(max_corner[2]),
+    )
+
+
+def build_preview_mesh_from_binary_stl(
+    path: Path,
+    metadata: BinaryStlMetadata,
+    *,
+    status_callback: StatusCallback | None = None,
+) -> pv.PolyData:
+    bounds = read_binary_stl_bounds(path, metadata, status_callback=status_callback)
+    x_divisions, y_divisions, z_divisions = compute_preview_divisions(bounds)
+
+    xmin, xmax, ymin, ymax, zmin, zmax = bounds
+    x_range = max(float(xmax - xmin), 1.0)
+    y_range = max(float(ymax - ymin), 1.0)
+    z_range = max(float(zmax - zmin), 1.0)
+
+    x_scale = x_divisions + 1
+    y_scale = y_divisions + 1
+    z_scale = z_divisions + 1
+    total_bins = x_scale * y_scale * z_scale
+
+    sum_x = np.zeros(total_bins, dtype=np.float64)
+    sum_y = np.zeros(total_bins, dtype=np.float64)
+    sum_z = np.zeros(total_bins, dtype=np.float64)
+    counts = np.zeros(total_bins, dtype=np.int64)
+    triangle_keys: set[int] = set()
+
+    total_chunks = max(1, math.ceil(metadata.triangle_count / STREAM_CHUNK_TRIANGLES))
+    status_interval = progress_update_interval(total_chunks)
+
+    for chunk_index, chunk in iter_binary_stl_chunks(path, metadata.triangle_count):
+        if (
+            chunk_index == 0
+            or chunk_index + 1 == total_chunks
+            or (chunk_index + 1) % status_interval == 0
+        ):
+            emit_status(status_callback, f"Building preview mesh... ({chunk_index + 1}/{total_chunks} chunks)")
+
+        vertices = chunk["vertices"].reshape(-1, 3)
+        qx = np.clip(np.rint(((vertices[:, 0] - xmin) / x_range) * x_divisions), 0, x_divisions).astype(np.int32)
+        qy = np.clip(np.rint(((vertices[:, 1] - ymin) / y_range) * y_divisions), 0, y_divisions).astype(np.int32)
+        qz = np.clip(np.rint(((vertices[:, 2] - zmin) / z_range) * z_divisions), 0, z_divisions).astype(np.int32)
+        vertex_keys = qx + (x_scale * (qy + (y_scale * qz)))
+
+        unique_vertex_keys, inverse = np.unique(vertex_keys, return_inverse=True)
+        counts[unique_vertex_keys] += np.bincount(inverse, minlength=unique_vertex_keys.size).astype(np.int64)
+        sum_x[unique_vertex_keys] += np.bincount(inverse, weights=vertices[:, 0], minlength=unique_vertex_keys.size)
+        sum_y[unique_vertex_keys] += np.bincount(inverse, weights=vertices[:, 1], minlength=unique_vertex_keys.size)
+        sum_z[unique_vertex_keys] += np.bincount(inverse, weights=vertices[:, 2], minlength=unique_vertex_keys.size)
+
+        triangle_vertex_keys = vertex_keys.reshape(-1, 3)
+        non_degenerate_mask = (
+            (triangle_vertex_keys[:, 0] != triangle_vertex_keys[:, 1])
+            & (triangle_vertex_keys[:, 0] != triangle_vertex_keys[:, 2])
+            & (triangle_vertex_keys[:, 1] != triangle_vertex_keys[:, 2])
+        )
+        if not np.any(non_degenerate_mask):
+            continue
+
+        triangle_vertex_keys = np.sort(triangle_vertex_keys[non_degenerate_mask], axis=1)
+        packed_triangle_keys = (
+            (triangle_vertex_keys[:, 0].astype(np.uint64) << np.uint64(TRIANGLE_KEY_BIT_SHIFT * 2))
+            | (triangle_vertex_keys[:, 1].astype(np.uint64) << np.uint64(TRIANGLE_KEY_BIT_SHIFT))
+            | triangle_vertex_keys[:, 2].astype(np.uint64)
+        )
+        triangle_keys.update(int(key) for key in np.unique(packed_triangle_keys))
+
+    active_vertex_keys = np.flatnonzero(counts)
+    if active_vertex_keys.size == 0 or not triangle_keys:
+        raise MeshViewerError(f"{path} does not contain any displayable mesh geometry.")
+
+    representative_points = np.column_stack(
+        [
+            (sum_x[active_vertex_keys] / counts[active_vertex_keys]).astype(np.float32),
+            (sum_y[active_vertex_keys] / counts[active_vertex_keys]).astype(np.float32),
+            (sum_z[active_vertex_keys] / counts[active_vertex_keys]).astype(np.float32),
+        ]
+    )
+    compact_index_by_key = np.full(total_bins, -1, dtype=np.int64)
+    compact_index_by_key[active_vertex_keys] = np.arange(active_vertex_keys.size, dtype=np.int64)
+
+    packed_triangle_array = np.fromiter(triangle_keys, dtype=np.uint64, count=len(triangle_keys))
+    triangle_a_keys = ((packed_triangle_array >> np.uint64(TRIANGLE_KEY_BIT_SHIFT * 2)) & np.uint64(TRIANGLE_KEY_MASK)).astype(
+        np.int64
+    )
+    triangle_b_keys = ((packed_triangle_array >> np.uint64(TRIANGLE_KEY_BIT_SHIFT)) & np.uint64(TRIANGLE_KEY_MASK)).astype(
+        np.int64
+    )
+    triangle_c_keys = (packed_triangle_array & np.uint64(TRIANGLE_KEY_MASK)).astype(np.int64)
+
+    triangle_a = compact_index_by_key[triangle_a_keys]
+    triangle_b = compact_index_by_key[triangle_b_keys]
+    triangle_c = compact_index_by_key[triangle_c_keys]
+    triangle_points_a = representative_points[triangle_a]
+    triangle_points_b = representative_points[triangle_b]
+    triangle_points_c = representative_points[triangle_c]
+    normals = np.cross(triangle_points_b - triangle_points_a, triangle_points_c - triangle_points_a)
+    valid_triangle_mask = np.linalg.norm(normals, axis=1) > FLOAT_TOLERANCE
+    if not np.any(valid_triangle_mask):
+        raise MeshViewerError(f"{path} does not contain any displayable mesh geometry.")
+
+    triangle_indices = np.column_stack(
+        [
+            triangle_a[valid_triangle_mask],
+            triangle_b[valid_triangle_mask],
+            triangle_c[valid_triangle_mask],
+        ]
+    )
+    faces = np.empty((triangle_indices.shape[0], 4), dtype=np.int64)
+    faces[:, 0] = 3
+    faces[:, 1:] = triangle_indices
+    return prepare_polydata(pv.PolyData(representative_points, faces.ravel()), "Preview mesh")
+
+
+def load_stl_mesh(path: Path, *, status_callback: StatusCallback | None = None) -> pv.PolyData:
+    emit_status(status_callback, "Loading full-resolution STL...")
+    mesh = pv.read(path)
+    emit_status(status_callback, "Preparing full-resolution mesh...")
+    return prepare_polydata(mesh, str(path))
 
 
 def compute_preview_divisions(bounds: tuple[float, float, float, float, float, float]) -> tuple[int, int, int]:
@@ -183,30 +415,56 @@ def cluster_mesh(source: pv.PolyData | vtk.vtkDataSet) -> pv.PolyData:
     return prepare_polydata(pv.wrap(clustering.GetOutput()), "Preview mesh")
 
 
-def build_preview_mesh_from_path(path: Path) -> pv.PolyData:
+def build_preview_mesh_from_path(path: Path, *, status_callback: StatusCallback | None = None) -> pv.PolyData:
+    emit_status(status_callback, "Loading STL with VTK...")
     reader = vtk.vtkSTLReader()
     reader.SetFileName(str(path))
     reader.Update()
+    emit_status(status_callback, "Simplifying preview mesh...")
     return cluster_mesh(reader.GetOutput())
 
 
-def load_mesh_state(path: Path) -> MeshLoadResult:
+def load_mesh_state(path: Path, *, status_callback: StatusCallback | None = None) -> MeshLoadResult:
     file_size_bytes = path.stat().st_size
-    if file_size_bytes > PREVIEW_FILE_SIZE_BYTES:
+    binary_metadata = inspect_binary_stl(path)
+    use_streamed_preview = (
+        binary_metadata is not None
+        and (file_size_bytes > PREVIEW_FILE_SIZE_BYTES or binary_metadata.triangle_count > PREVIEW_CELL_THRESHOLD)
+    )
+    if use_streamed_preview and binary_metadata is not None:
         print(
-            f"Large STL detected ({format_file_size(file_size_bytes)}). "
+            f"Large or dense STL detected ({format_file_size(file_size_bytes)}). "
             "Building a lighter preview mesh for interactive viewing..."
         )
-        render_mesh = build_preview_mesh_from_path(path)
+        render_mesh = build_preview_mesh_from_binary_stl(path, binary_metadata, status_callback=status_callback)
         return MeshLoadResult(
             render_mesh=render_mesh,
             exact_mesh=None,
             render_mode="Preview",
             file_size_bytes=file_size_bytes,
-            exact_cell_count=None,
+            exact_cell_count=binary_metadata.triangle_count,
+            exact_load_warning_required=requires_exact_load_warning(file_size_bytes, binary_metadata.triangle_count),
         )
 
-    exact_mesh = load_stl_mesh(path)
+    if file_size_bytes > PREVIEW_FILE_SIZE_BYTES:
+        print(
+            f"Large STL detected ({format_file_size(file_size_bytes)}). "
+            "Building a lighter preview mesh for interactive viewing..."
+        )
+        render_mesh = build_preview_mesh_from_path(path, status_callback=status_callback)
+        return MeshLoadResult(
+            render_mesh=render_mesh,
+            exact_mesh=None,
+            render_mode="Preview",
+            file_size_bytes=file_size_bytes,
+            exact_cell_count=binary_metadata.triangle_count if binary_metadata is not None else None,
+            exact_load_warning_required=requires_exact_load_warning(
+                file_size_bytes,
+                None if binary_metadata is None else binary_metadata.triangle_count,
+            ),
+        )
+
+    exact_mesh = load_stl_mesh(path, status_callback=status_callback)
     if exact_mesh.n_cells > PREVIEW_CELL_THRESHOLD:
         print(
             f"STL contains {exact_mesh.n_cells:,} triangles. "
@@ -516,6 +774,7 @@ class MeshViewerApp:
         self.file_size_bytes = load_result.file_size_bytes
         self.exact_cell_count = load_result.exact_cell_count
         self.lazy_exact_load = load_result.needs_lazy_exact_load
+        self.exact_load_warning_required = load_result.exact_load_warning_required
 
         self.display_mesh = self.render_mesh.copy(deep=True)
         self.profile_section_mesh = pv.PolyData()
@@ -800,9 +1059,14 @@ class MeshViewerApp:
             f"Render mesh: {self.render_mode} ({self.render_mesh.n_cells:,} triangles shown)",
             f"STL size: {format_file_size(self.file_size_bytes)}",
         ]
+        if self.exact_cell_count is not None:
+            lines.append(f"Source triangles: {self.exact_cell_count:,}")
         if self.render_mode == "Preview":
             if self.exact_mesh is None:
-                lines.append("Exact profile: loads the full STL on demand")
+                if self.exact_load_warning_required:
+                    lines.append("Exact profile: full-resolution load available on demand after warning")
+                else:
+                    lines.append("Exact profile: loads the full STL on demand")
             else:
                 lines.append(f"Exact profile: cached full mesh ({self.exact_mesh.n_cells:,} triangles)")
         else:

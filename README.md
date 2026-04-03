@@ -1,8 +1,10 @@
 # Terrain to STL
 
-This project contains an interactive Python converter that turns either an HEC-RAS terrain HDF or a DEM GeoTIFF into a watertight STL shell.
+This project contains:
 
-It also contains a desktop STL mesh viewer so you can rotate the mesh, inspect the shell interior, look up at the terrain underside, and verify the flat top surface.
+- an interactive Python converter that turns either an HEC-RAS terrain HDF or a DEM GeoTIFF into a watertight STL shell
+- a native Python desktop GUI with an integrated STL viewer
+- a standalone desktop STL mesh viewer so you can rotate the mesh, inspect the shell interior, look up at the terrain underside, and verify the flat top surface
 
 The converter:
 
@@ -18,10 +20,28 @@ The script entrypoint is:
 python terrain_to_stl.py
 ```
 
+The converter also accepts optional command-line flags so the desktop bundle and CI can run it non-interactively:
+
+```powershell
+python terrain_to_stl.py --input example\example.hdf --top-elevation 100 --sample-step 8
+```
+
 The mesh viewer entrypoint is:
 
 ```powershell
 python mesh_viewer.py
+```
+
+The native desktop GUI entrypoint is:
+
+```powershell
+python desktop_gui.py
+```
+
+The structured console backend entrypoint is:
+
+```powershell
+python desktop_console.py
 ```
 
 ## Static Web App
@@ -50,7 +70,7 @@ Important:
 
 - the web app uses `Node.js` and `npm`
 - it does not use the Python `.venv`
-- the Python setup in this repo is only for `terrain_to_stl.py` and `mesh_viewer.py`
+- the Python setup in this repo is for the desktop tools such as `desktop_gui.py`, `desktop_console.py`, `terrain_to_stl.py`, and `mesh_viewer.py`
 
 ### Run the Web App in VS Code
 
@@ -126,6 +146,13 @@ cd webapp
 npm run build
 ```
 
+To run the webapp tests:
+
+```powershell
+cd webapp
+npm test
+```
+
 The static output is written to:
 
 - `webapp\dist`
@@ -152,9 +179,43 @@ It installs the `webapp` dependencies, runs the production build, and publishes 
 - if a `.vrt` references additional raster files, those files must also be uploaded in the same session
 - browser VRT source paths are matched to uploaded files by basename, so absolute Windows paths inside the VRT can still resolve if the referenced TIFF basename is uploaded
 - unsupported browser VRT features such as warped or derived VRT bands fail with a clear error instead of partial conversion
+- browser inspection now reads raster headers first, so large HDF terrains can finish inspection without decoding the full raster into browser memory
+- stitched browser sample steps now use local refinement around stitch components and expose preset stitch-aware steps `1`, `2`, `4`, `8`, `16`, and `32`
+- browser conversion keeps `sample step 1` on the full-resolution decode path, but higher browser sample steps now read only the exact sampled raster rows plus any stitch refinement windows they need
+- that sparse browser decode does not add any extra approximation beyond the selected raster sample step; the sampled elevations and stitch-aware refinement geometry are still exact for that chosen step
+- browser conversion is blocked before raster decode if either limit is exceeded:
+  - estimated peak working set above `2.5 GiB`
+  - estimated STL size above `256 MiB`
+- browser STL viewer uploads above `256 MiB` are blocked before the file is read into browser memory
+- files near those limits can still slow down or crash the browser, even if they are not blocked
+- the web app points large or near-limit browser runs to the portable Windows desktop workflow download published on GitHub Releases
 - the browser viewer renders a lighter preview mesh for interaction and keeps the exact STL in a worker for on-demand profile measurement
 - the browser viewer defaults to surface opacity `0.8`, just like the desktop viewer
 - the desktop Python scripts remain the reference workflow for large local runs
+- a separate GitHub Actions workflow builds a portable Windows desktop ZIP and publishes it as a GitHub Release asset
+- the desktop bundle launchers are generated into the extracted bundle root during the build; the runnable local test target is the built bundle under `dist`, not any source asset folder
+
+### Desktop Bundle Development
+
+To build the portable Windows bundle locally:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_desktop_bundle.ps1 -BundleVersion local-test -OutputRoot dist\desktop-smoke
+```
+
+After the build finishes, run the desktop workflow from the extracted bundle folder:
+
+```text
+dist\desktop-smoke\terrain-to-stl-desktop-windows-x64\
+```
+
+Run these files from that extracted folder:
+
+- `Run Desktop GUI.cmd`
+
+The `app\` folder beside it is bundle internals and should stay together with `python.exe`.
+If `Run Desktop GUI.cmd` does not show the viewer loading overlay while opening a large STL, rebuild the bundle from source because the copied desktop app under `dist` is stale.
+The desktop GUI accepts a terrain file set such as `HDF + VRT/TIF` selections, shows which files are associated with the primary terrain input, includes the same vertical exaggeration control used by the browser viewer, uses fixed sample-step presets `1`, `2`, `4`, `8`, `16`, and `32`, shows per-step STL size estimates plus a calibrated time estimate for the currently selected step, and includes the integrated STL viewer in the same app.
 
 ## Requirements
 
@@ -169,6 +230,9 @@ Python packages required by the script:
 - `h5py`
 - `rasterio`
 - `pyvista`
+- `matplotlib`
+- `PySide6`
+- `pyvistaqt`
 
 These packages are pinned in:
 
@@ -250,6 +314,12 @@ Once the virtual environment is active, run:
 
 ```powershell
 python terrain_to_stl.py
+```
+
+Optional non-interactive arguments:
+
+```powershell
+python terrain_to_stl.py --input input\Terrain_Example.hdf --top-elevation 100 --sample-step 8 --output input\Terrain_Example.stl
 ```
 
 You can also use the VS Code Python extension Run button, but the integrated terminal is the simplest option because the script is interactive.
@@ -349,8 +419,10 @@ For large STL files, the viewer now opens with a lighter preview mesh so clip an
 
 This means:
 
+- the desktop GUI shows a loading overlay while it reads the STL and builds the preview
+- large binary STL files build that preview from a streamed reader instead of fully materializing the mesh first
 - normal rotation, clip, and profile updates use the preview mesh
-- `Measure Exact` loads the full STL only when needed
+- `Measure Exact` loads the full STL only when needed, and very large files warn before the full-resolution load starts
 - `Full Shell` keeps the profile clean by plotting top and bottom envelopes instead of the noisy raw shell loop
 - the rendered shell stays in preview mode even after an exact profile, so interaction remains fast
 
@@ -408,11 +480,8 @@ Guidance:
 - `1` = full raster resolution
 - larger values reduce detail and reduce STL size
 - the script always includes the last raster row and column
-
-Important limitation:
-
-- if the HDF contains populated stitch TIN data, the sample step must be `1`
-- if populated stitch TIN data exists and you enter `2`, `4`, `8`, etc., the script stops with an error
+- stitched terrains support preset stitch-aware steps `1`, `2`, `4`, `8`, `16`, and `32`
+- non-stitched terrains still accept any integer sample step greater than or equal to `1`
 
 ## Example Session
 
@@ -472,14 +541,16 @@ The converter does not build the full terrain surface from the `.hdf` alone.
 
 Large terrain rasters can create very large STL files.
 
-Large STL files can still take time to open because the viewer has to read the STL before it can build the preview mesh.
+Large STL files can still take time to open, but the desktop viewer now shows a loading overlay while it works.
 
-After that initial load, the viewer uses a lighter preview mesh for interaction and only loads the exact mesh when you click `Measure Exact`.
+For large binary STL files, the viewer builds the interactive preview from a streamed reader instead of waiting for a full-resolution VTK load first.
+
+After that preview load, the viewer uses the lighter mesh for interaction and only loads the exact mesh when you click `Measure Exact`.
 
 Use these rules of thumb:
 
 - use sample step `1` only when you need native detail
-- use larger sample steps to reduce output size when stitch TIN data is not populated
+- use larger sample steps to reduce output size for any terrain, but stitched terrains are limited to the preset values `1`, `2`, `4`, `8`, `16`, and `32`
 - if top elevation is lower than the terrain maximum, crop the terrain extent externally and try again
 - use `Restore All` if the current clip/profile state becomes confusing
 - use `Bottom Only` for underside inspection and `Full Shell` when you want to compare bottom and top together
@@ -533,21 +604,21 @@ In HDF mode, make sure the HDF has a matching `.vrt`, `.tif`, or `.tiff` beside 
 
 Choose a larger top elevation, or reduce the terrain extent to the area you want to export.
 
-### "This terrain contains populated stitch TIN data"
+### "Supported stitch-aware raster sample steps are 1, 2, 4, 8, 16, 32"
 
-For the current version of the script, stitched terrains must run with:
+The stitched terrain path now supports these preset sample steps:
 
 ```text
-Raster sample step = 1
+Raster sample step = 1, 2, 4, 8, 16, or 32
 ```
 
 ### The viewer opens but interaction feels slow
 
-Very large STL files still take time to open, and the first exact profile on a large STL can take several seconds because it loads the full-resolution mesh.
+Very large STL files still take time to open, and the first exact profile on a large STL can take several seconds because it loads the full-resolution mesh after a warning prompt.
 
 Try one or more of these:
 
-- create a smaller STL with a larger raster sample step when stitch TIN data is not populated
+- create a smaller STL with a larger raster sample step
 - crop the terrain extent before converting
 - use the preview section first and click `Measure Exact` only when needed
 - use `Restore All` instead of repeatedly dragging widgets back into place

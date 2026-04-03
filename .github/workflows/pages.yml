@@ -42,6 +42,8 @@ jobs:
 
       - name: Build web app
         working-directory: webapp
+        env:
+          VITE_DESKTOP_WORKFLOW_URL: https://github.com/${{ github.repository }}/releases/latest/download/terrain-to-stl-desktop-windows-x64.zip
         run: npm run build
 
       - name: Upload Pages artifact

@@ -2,8 +2,20 @@ import { useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent 
 import type { ActiveElement, ChartOptions, ScriptableContext } from 'chart.js';
 import { Line } from 'react-chartjs-2';
 import 'chart.js/auto';
+import { BROWSER_STL_SIZE_LIMIT_BYTES } from '../lib/browserTerrainLimits';
+import {
+  BROWSER_VIEWER_STL_LIMIT_ERROR_MESSAGE,
+  getViewerStlBrowserLimitResult,
+  readViewerStlArrayBufferForBrowserViewer,
+  type ViewerStlBrowserLimitResult,
+} from '../lib/browserStlLimits';
 import { ConverterWorkspace } from '../components/ConverterWorkspace';
 import { MeshScene } from '../components/MeshScene';
+import {
+  DESKTOP_WORKFLOW_STEPS,
+  DESKTOP_WORKFLOW_WARNING,
+  resolveDesktopWorkflowUrl,
+} from '../lib/desktopWorkflow';
 import { fetchExampleStlFile } from '../lib/exampleAssets';
 import type {
   ActiveView,
@@ -70,6 +82,17 @@ function formatFileSizeMb(byteCount: number): string {
   return `${(byteCount / (1024 * 1024)).toFixed(byteCount >= 10 * 1024 * 1024 ? 1 : 2)} MB`;
 }
 
+function formatBinaryBytes(byteCount: number): string {
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = byteCount;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(unitIndex === 0 ? 0 : 2)} ${units[unitIndex]}`;
+}
+
 export function ViewerPage() {
   const workerRef = useRef<Worker | null>(null);
   const requestIdRef = useRef(0);
@@ -82,6 +105,7 @@ export function ViewerPage() {
   const [meshName, setMeshName] = useState<string | null>(null);
   const [loadedStlFile, setLoadedStlFile] = useState<File | null>(null);
   const [selectedStlFile, setSelectedStlFile] = useState<File | null>(null);
+  const [viewerLimitResult, setViewerLimitResult] = useState<ViewerStlBrowserLimitResult | null>(null);
   const [bounds, setBounds] = useState<MeshBounds | null>(null);
   const [previewPositions, setPreviewPositions] = useState<Float32Array | null>(null);
   const [triangleCount, setTriangleCount] = useState(0);
@@ -131,6 +155,7 @@ export function ViewerPage() {
   const profileDrawerSourceLabel = exactValuesEnabled ? 'Exact' : 'Preview';
   const selectedStlFileLabel = selectedStlFile?.name ?? 'No STL selected';
   const loadedFileSizeLabel = loadedStlFile ? formatFileSizeMb(loadedStlFile.size) : 'n/a';
+  const browserStlLimitLabel = formatBinaryBytes(BROWSER_STL_SIZE_LIMIT_BYTES);
   const viewerCenterClassName = [
     'viewer-center',
     profileEnabled
@@ -141,6 +166,11 @@ export function ViewerPage() {
   ]
     .filter(Boolean)
     .join(' ');
+  const desktopWorkflowUrl = resolveDesktopWorkflowUrl({
+    override: import.meta.env.VITE_DESKTOP_WORKFLOW_URL,
+    hostname: globalThis.location?.hostname,
+    baseUrl: import.meta.env.BASE_URL,
+  });
 
   const clipState = useMemo<ClipState>(
     () => ({
@@ -209,6 +239,11 @@ export function ViewerPage() {
         setHoveredProfileMarker(null);
         setPickMode(null);
         setError(null);
+        setStatus(
+          result.renderMode === 'preview'
+            ? 'STL loaded. Preview mesh ready in the browser viewer.'
+            : 'STL loaded. Exact mesh ready in the browser viewer.',
+        );
         setProfileBusy(false);
         return;
       }
@@ -306,6 +341,7 @@ export function ViewerPage() {
     setMeshName(null);
     setLoadedStlFile(null);
     setSelectedStlFile(null);
+    setViewerLimitResult(null);
     setBounds(null);
     setPreviewPositions(null);
     setTriangleCount(0);
@@ -336,22 +372,77 @@ export function ViewerPage() {
     pendingMeshFileRef.current = null;
   }
 
-  async function loadMesh(file: File, replaceCurrentMesh = false): Promise<void> {
+  function renderDesktopWorkflowAction(label: string): JSX.Element | null {
+    if (!desktopWorkflowUrl) {
+      return null;
+    }
+
+    return (
+      <a
+        className="button-link desktop-workflow-download-link"
+        href={desktopWorkflowUrl}
+        rel="noopener noreferrer"
+      >
+        {label}
+      </a>
+    );
+  }
+
+  function renderViewerLimitCallout(): JSX.Element | null {
+    if (!viewerLimitResult?.recommendation) {
+      return null;
+    }
+
+    const fileDetails = selectedStlFile
+      ? `Selected file: ${selectedStlFile.name} (${formatBinaryBytes(selectedStlFile.size)}).`
+      : null;
+
+    return (
+      <div className={`desktop-workflow-callout ${viewerLimitResult.recommendation.severity}`}>
+        <p className="desktop-workflow-callout-title">{viewerLimitResult.recommendation.headline}</p>
+        <p>{viewerLimitResult.recommendation.summary}</p>
+        <p className="muted">
+          Browser STL limit: {formatBinaryBytes(viewerLimitResult.limitBytes)}.
+          {fileDetails ? ` ${fileDetails}` : ''}
+        </p>
+        {renderDesktopWorkflowAction(
+          viewerLimitResult.recommendation.severity === 'blocked'
+            ? 'Download Desktop Workflow ZIP'
+            : 'Download Desktop Workflow',
+        )}
+        {viewerLimitResult.recommendation.severity === 'blocked' ? (
+          <ol className="desktop-workflow-steps">
+            {DESKTOP_WORKFLOW_STEPS.map((step) => (
+              <li key={step}>{step}</li>
+            ))}
+          </ol>
+        ) : null}
+        <p className="muted">{DESKTOP_WORKFLOW_WARNING}</p>
+      </div>
+    );
+  }
+
+  async function loadMesh(file: File): Promise<void> {
     if (!workerRef.current) {
       return;
     }
     if (!isStlFile(file)) {
       throw new Error('The viewer only accepts .stl files.');
     }
-    if (replaceCurrentMesh && hasMesh) {
-      resetViewerState(true);
-    }
+    const nextViewerLimitResult = getViewerStlBrowserLimitResult(file.size);
     setSelectedStlFile(file);
-    setStatus('Loading STL into browser worker...');
+    setViewerLimitResult(nextViewerLimitResult.recommendation ? nextViewerLimitResult : null);
+    setStatus(
+      nextViewerLimitResult.blocked
+        ? 'The selected STL is too large for the browser viewer.'
+        : nextViewerLimitResult.nearLimit
+          ? 'Loading large STL into browser worker...'
+          : 'Loading STL into browser worker...',
+    );
     setError(null);
     pendingMeshFileRef.current = file;
     try {
-      const bytes = await file.arrayBuffer();
+      const { bytes } = await readViewerStlArrayBufferForBrowserViewer(file);
       workerRef.current.postMessage(
         {
           type: 'loadMesh',
@@ -362,6 +453,9 @@ export function ViewerPage() {
       );
     } catch (loadError) {
       pendingMeshFileRef.current = null;
+      if (loadError instanceof Error && loadError.message === BROWSER_VIEWER_STL_LIMIT_ERROR_MESSAGE) {
+        setStatus('The selected STL is too large for the browser viewer.');
+      }
       throw loadError;
     }
   }
@@ -432,7 +526,7 @@ export function ViewerPage() {
   }
 
   async function openConvertedStlInViewer(file: File): Promise<void> {
-    await loadMesh(file, true);
+    await loadMesh(file);
     closeConverterModal();
   }
 
@@ -446,7 +540,7 @@ export function ViewerPage() {
 
     try {
       const exampleFile = await fetchExampleStlFile();
-      await loadMesh(exampleFile, true);
+      await loadMesh(exampleFile);
     } catch (exampleError) {
       setError(exampleError instanceof Error ? exampleError.message : String(exampleError));
       setStatus('The example STL could not be loaded.');
@@ -506,7 +600,7 @@ export function ViewerPage() {
     }
 
     try {
-      await loadMesh(file, true);
+      await loadMesh(file);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     }
@@ -676,6 +770,7 @@ export function ViewerPage() {
                 {selectedStlFileLabel}
               </div>
             </div>
+            <p className="muted">Browser STL limit: {browserStlLimitLabel}. Use the desktop workflow for larger local inspection.</p>
             <input
               ref={fileInputRef}
               key={fileInputKey}
@@ -697,6 +792,7 @@ export function ViewerPage() {
           <div className="status-box">
             <strong>Status</strong>
             <p>{status}</p>
+            {renderViewerLimitCallout()}
             {meshName ? (
               <dl className="sidebar-meta-list">
                 <div>
