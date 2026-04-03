@@ -392,11 +392,9 @@ class DesktopViewerWidget(QWidget):
 
         self.details_text = QPlainTextEdit()
         self.details_text.setReadOnly(True)
-        self.details_text.setMinimumHeight(130)
         panel_layout.addWidget(self.details_text, 1)
 
         self.chart_canvas = ProfileChartCanvas(self)
-        self.chart_canvas.setMinimumHeight(170)
         self.chart_canvas.hide()
         panel_layout.addWidget(self.chart_canvas, 1)
 
@@ -1380,7 +1378,6 @@ class DesktopGuiWindow(QMainWindow):
 
         self.selected_files_text = QPlainTextEdit()
         self.selected_files_text.setReadOnly(True)
-        self.selected_files_text.setMinimumHeight(90)
         self.selected_files_text.setPlainText("No terrain files selected yet.")
         files_layout.addRow("Selected files", self.selected_files_text)
 
@@ -1472,7 +1469,6 @@ class DesktopGuiWindow(QMainWindow):
 
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMinimumHeight(160)
         convert_layout.addWidget(self.log_text, 1)
 
         tabs.addTab(convert_tab, "Convert")
